@@ -11,9 +11,15 @@ from telethon.sessions import StringSession
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 
-BOT = "@Globalccvs_Bot"
-TRIGGER_USERNAME = "ccscards_bot"
-TRIGGER_USERNAME_2 = "globalccvs_bot"
+# Bot único (recibe comandos Y envía triggers)
+BOT = "@KingKongccs2bot"
+TRIGGER_USERNAME = "kingkongccs2bot"   # mismo bot
+
+# Palabra clave para trigger manual (Saved Messages)
+MANUAL_TRIGGER_WORD = "run_test"
+
+# Cooldown entre flujos (segundos) para evitar cadenas
+TRIGGER_COOLDOWN = 5
 
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION", "").strip()
 
@@ -24,10 +30,10 @@ TIMEOUT = 45
 CLICK_TIMEOUT = 3
 MAX_RETRIES = 3
 RETRY_SLEEP = 1
-HEADER_ATTEMPTS = 2       # intentos de clic en tarjeta
-CHECK_ATTEMPTS = 2        # intentos de clic en check (nuevo)
+HEADER_ATTEMPTS = 2
+CHECK_ATTEMPTS = 2
 
-POLL_INTERVAL = 0.4
+POLL_INTERVAL = 0.5
 MAX_PAGES = 300
 
 if not os.path.exists(PRODUCTOS_FILE):
@@ -46,14 +52,15 @@ CARD_HEADER_FAIL_MSG = "If you fail to obtain the card header information, pleas
 used_buttons = set()
 
 BOT_ID = None
-TRIGGER_ID = None
-TRIGGER_ID_2 = None
 
 refund_detected = False
 refund_event = asyncio.Event()
 
+# Anti-cadena: timestamp del último flujo iniciado
+last_flow_start = 0
+
 # ============================================================
-# MÉTRICAS GLOBALES
+# MÉTRICAS
 # ============================================================
 
 METRICS = {}
@@ -156,20 +163,6 @@ def print_run_summary():
         print()
 
     print("=" * 72 + "\n")
-
-# ============================================================
-# WHITELIST TRIGGER 2
-# ============================================================
-TRIGGER_WHITELIST = ["news cc", "new bases"]
-
-def is_trigger_message(text):
-    if not text:
-        return False
-    text_lower = text.lower()
-    for kw in TRIGGER_WHITELIST:
-        if kw in text_lower:
-            return True
-    return False
 
 # ============================================================
 # POLLING ENGINE
@@ -410,7 +403,7 @@ async def navigate_to_page(current_page, target_page, message):
     return message
 
 # ============================================================
-# COMPRA (v8.8.6: reintentos de tarjeta y check separados)
+# COMPRA
 # ============================================================
 
 async def purchase_item(record, current_page, message):
@@ -440,9 +433,6 @@ async def purchase_item(record, current_page, message):
         METRICS["purchase_times"].append((record["id"], time.monotonic() - item_start, "button_gone"))
         return True, current_page, message
 
-    # ========================================================
-    # BUCLE EXTERNO: intentos de clic en TARJETA (4 intentos)
-    # ========================================================
     for card_attempt in range(1, HEADER_ATTEMPTS + 1):
         if card_attempt > 1:
             METRICS["header_card_retries"] += 1
@@ -482,9 +472,8 @@ async def purchase_item(record, current_page, message):
         if response.text and CARD_HEADER_FAIL_MSG in response.text:
             log(f"   ⚠️ Error de cabecera tras TARJETA. Reintentando tarjeta...")
             await asyncio.sleep(2)
-            continue  # volver a intentar tarjeta
+            continue
 
-        # Tenemos respuesta válida con botón check
         log("   Respuesta del bot tras clic en tarjeta:")
         print_message(response)
 
@@ -495,20 +484,15 @@ async def purchase_item(record, current_page, message):
             METRICS["purchase_times"].append((record["id"], time.monotonic() - item_start, "check_missing"))
             return True, current_page, message
 
-        # ====================================================
-        # BUCLE INTERNO: intentos de clic en CHECK (4 intentos)
-        # sin perder la reserva
-        # ====================================================
         log(f"   -> [CHECK] Botón encontrado. Iniciando {CHECK_ATTEMPTS} intentos de check...")
         for check_attempt in range(1, CHECK_ATTEMPTS + 1):
             if check_attempt > 1:
                 METRICS["header_check_retries"] += 1
                 log(f"   🔄 [CHECK] Reintento {check_attempt - 1}/{CHECK_ATTEMPTS - 1}...")
-                # Verificar que el botón check siga existiendo en el mensaje
                 check_btn = await find_check_button(response)
                 if not check_btn:
-                    log("   ✗ El botón check ya no existe en el mensaje. Saltando tarjeta.")
-                    break  # salir del bucle check, volver a intentar tarjeta
+                    log("   ✗ El botón check ya no existe. Saltando tarjeta.")
+                    break
 
             log(f"   [CHECK] Clic (intento {check_attempt}/{CHECK_ATTEMPTS})...")
             t0 = time.perf_counter()
@@ -517,7 +501,6 @@ async def purchase_item(record, current_page, message):
 
             if final is None:
                 log("   ✗ No hubo respuesta al check.")
-                # Si no hubo respuesta, reintentar check
                 continue
 
             final_text = final.text or ""
@@ -525,7 +508,7 @@ async def purchase_item(record, current_page, message):
             if CARD_HEADER_FAIL_MSG in final_text:
                 log(f"   ⚠️ Error de cabecera tras CHECK. Reintentando check...")
                 await asyncio.sleep(2)
-                continue  # reintentar check en el mismo mensaje
+                continue
 
             if INSUFFICIENT_MSG in final_text:
                 log("   ✗ Saldo insuficiente tras check.")
@@ -539,19 +522,16 @@ async def purchase_item(record, current_page, message):
                 METRICS["purchase_times"].append((record["id"], time.monotonic() - item_start, "order_failed"))
                 return True, current_page, message
 
-            # Si llegamos aquí, la compra se completó
             log("   ✅ COMPRA CONFIRMADA:")
             print_message(final)
             METRICS["purchases_ok"] += 1
             METRICS["purchase_times"].append((record["id"], time.monotonic() - item_start, "ok"))
             return True, current_page, message
 
-        # Si salimos del bucle check sin éxito (agotó 4 intentos o botón desapareció)
         log(f"   ✗ Check agotó sus {CHECK_ATTEMPTS} intentos. Reintentando tarjeta desde cero...")
         await asyncio.sleep(2)
-        continue  # volver al bucle de tarjeta
+        continue
 
-    # Se agotaron los intentos de tarjeta
     log(f"   ✗ Tarjeta agotó sus {HEADER_ATTEMPTS} intentos. Saltando artículo.")
     METRICS["purchases_header_fail"] += 1
     METRICS["purchase_times"].append((record["id"], time.monotonic() - item_start, "header_fail_exhausted"))
@@ -622,7 +602,7 @@ async def main(trigger_name):
     global refund_detected
 
     reset_metrics(trigger_name)
-    log(f"\n>>> SCRIPT v8.8.6 - TRIGGER @{trigger_name} <<<")
+    log(f"\n>>> SCRIPT v8.8.7 - TRIGGER @{trigger_name} <<<")
 
     while True:
         used_buttons.clear()
@@ -723,6 +703,7 @@ async def main(trigger_name):
 # ============================================================
 
 async def refund_handler(event):
+    """Detecta mensajes de refund (aunque ya no reinicia, solo loguea)."""
     global refund_detected
     if BOT_ID is not None and event.sender_id != BOT_ID:
         return
@@ -738,11 +719,17 @@ async def refund_handler(event):
 _is_running = False
 
 async def trigger_flow(trigger_name):
-    global _is_running
+    global _is_running, last_flow_start
     if _is_running:
         log(f">>> Ya hay una ejecución en curso. Ignorando trigger de @{trigger_name}. <<<")
         return
+    # Cooldown anti-cadena
+    elapsed = time.monotonic() - last_flow_start
+    if elapsed < TRIGGER_COOLDOWN:
+        log(f">>> Cooldown activo ({elapsed:.1f}s < {TRIGGER_COOLDOWN}s). Ignorando trigger de @{trigger_name}. <<<")
+        return
     _is_running = True
+    last_flow_start = time.monotonic()
     try:
         log("=" * 60)
         log(f">>> TRIGGER RECIBIDO de @{trigger_name} - INICIANDO <<<")
@@ -754,27 +741,31 @@ async def trigger_flow(trigger_name):
         _is_running = False
         log(f">>> Flujo terminado. Esperando próximo trigger... <<<")
 
-async def trigger_handler_1(event):
-    log(f"   [trigger-1] Evento recibido de {event.sender_id} (ID del trigger: {TRIGGER_ID})")
-    asyncio.create_task(trigger_flow(TRIGGER_USERNAME))
-
-async def trigger_handler_2(event):
+async def bot_trigger_handler(event):
+    """Cualquier mensaje del bot de compras dispara el flujo."""
     if event.message.out:
         return
     text = event.message.text or ""
-    if not is_trigger_message(text):
-        log(f"   [trigger-2] IGNORADO (no es trigger): {text[:80]!r}")
+    # Ignorar mensajes que claramente son respuestas operativas de nuestras acciones
+    # (aunque durante el flujo el lock ya los ignora)
+    log(f"   [bot-trigger] Mensaje recibido de {event.sender_id}: {text[:80]!r}")
+    asyncio.create_task(trigger_flow(TRIGGER_USERNAME))
+
+async def manual_trigger_handler(event):
+    """Trigger manual: cuando TÚ te envías 'run_test' a Saved Messages."""
+    if not event.message.out:
         return
-    log(f"   [trigger-2] ✅ TRIGGER VÁLIDO recibido de {event.sender_id}")
-    log(f"   [trigger-2] Texto (primeros 120 chars): {text[:120]!r}")
-    asyncio.create_task(trigger_flow(TRIGGER_USERNAME_2))
+    text = (event.message.text or "").strip().lower()
+    if MANUAL_TRIGGER_WORD in text:
+        log(f"   [trigger-manual] ✅ Palabra '{MANUAL_TRIGGER_WORD}' detectada. Disparando flujo...")
+        asyncio.create_task(trigger_flow("MANUAL_TEST"))
 
 # ============================================================
 # ARRANQUE
 # ============================================================
 
 async def run_forever():
-    global BOT_ID, TRIGGER_ID, TRIGGER_ID_2
+    global BOT_ID
     while True:
         try:
             if not SESSION_STRING:
@@ -792,37 +783,27 @@ async def run_forever():
                 except Exception as e:
                     log(f">>> No se pudo resolver ID de {BOT}: {e!r} <<<")
 
-            if TRIGGER_ID is None:
-                try:
-                    trigger_entity = await client.get_entity(TRIGGER_USERNAME)
-                    TRIGGER_ID = trigger_entity.id
-                    log(f">>> ID de @{TRIGGER_USERNAME} resuelto: {TRIGGER_ID} <<<")
-                except Exception as e:
-                    log(f">>> No se pudo resolver trigger 1: {e!r} <<<")
-
-            if TRIGGER_USERNAME_2 and TRIGGER_ID_2 is None:
-                try:
-                    trigger_entity_2 = await client.get_entity(TRIGGER_USERNAME_2)
-                    TRIGGER_ID_2 = trigger_entity_2.id
-                    log(f">>> ID de @{TRIGGER_USERNAME_2} resuelto: {TRIGGER_ID_2} <<<")
-                except Exception as e:
-                    log(f">>> No se pudo resolver trigger 2: {e!r} <<<")
-
-            client.remove_event_handler(trigger_handler_1, events.NewMessage)
-            client.remove_event_handler(trigger_handler_2, events.NewMessage)
+            client.remove_event_handler(bot_trigger_handler, events.NewMessage)
             client.remove_event_handler(refund_handler, events.NewMessage)
+            client.remove_event_handler(manual_trigger_handler, events.NewMessage)
 
-            client.add_event_handler(trigger_handler_1, events.NewMessage(from_users=TRIGGER_ID))
-            if TRIGGER_ID_2 is not None:
-                client.add_event_handler(trigger_handler_2, events.NewMessage(from_users=TRIGGER_ID_2))
+            # Trigger principal: cualquier mensaje del bot
+            client.add_event_handler(bot_trigger_handler, events.NewMessage(from_users=BOT_ID))
+
+            # Refund detector (para logging)
             client.add_event_handler(refund_handler, events.NewMessage())
 
-            log(">>> SERVICIO v8.8.6 ACTIVO (COL) - Reintentos separados TARJETA/CHECK <<<")
+            # Trigger manual (Saved Messages)
+            client.add_event_handler(
+                manual_trigger_handler,
+                events.NewMessage(chats='me', outgoing=True)
+            )
+
+            log(">>> SERVICIO v8.8.7 ACTIVO (COL) - Bot: @KingKongccs2bot <<<")
             log(f">>> Logueado como: {me.first_name} (@{me.username}) <<<")
-            log(f">>> Trigger 1: @{TRIGGER_USERNAME} (ID: {TRIGGER_ID}) <<<")
-            if TRIGGER_ID_2 is not None:
-                log(f">>> Trigger 2: @{TRIGGER_USERNAME_2} (ID: {TRIGGER_ID_2}) <<<")
-            log(f">>> Refunds de {BOT} (ID: {BOT_ID}) <<<")
+            log(f">>> Bot: {BOT} (ID: {BOT_ID}) <<<")
+            log(f">>> Cualquier mensaje de {BOT} dispara el flujo (cooldown: {TRIGGER_COOLDOWN}s) <<<")
+            log(f">>> Trigger MANUAL: envíate '{MANUAL_TRIGGER_WORD}' a Saved Messages <<<")
             log(f">>> Precio máx: ${MAX_PRICE} | Tarjeta: {HEADER_ATTEMPTS} | Check: {CHECK_ATTEMPTS} | Clic: {MAX_RETRIES}x cada {RETRY_SLEEP}s <<<")
 
             await client.run_until_disconnected()
