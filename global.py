@@ -8,18 +8,21 @@ from telethon.sessions import StringSession
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
+API_ID = int(os.environ.get("API_ID", 21585700))
+API_HASH = os.environ.get("API_HASH", "34aea5894918c1155fc0e8d432396880")
 
 # Bot único (recibe comandos Y envía triggers)
 BOT = "@KingKongccs2bot"
-TRIGGER_USERNAME = "kingkongccs2bot"   # mismo bot
+TRIGGER_USERNAME = "kingkongccs2bot"
 
 # Palabra clave para trigger manual (Saved Messages)
 MANUAL_TRIGGER_WORD = "run_test"
 
 # Cooldown entre flujos (segundos) para evitar cadenas
 TRIGGER_COOLDOWN = 5
+
+# Debug: loguear TODOS los mensajes entrantes/salientes
+DEBUG_ALL_MESSAGES = os.environ.get("DEBUG_ALL_MESSAGES", "1").strip() == "1"
 
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION", "").strip()
 
@@ -52,11 +55,11 @@ CARD_HEADER_FAIL_MSG = "If you fail to obtain the card header information, pleas
 used_buttons = set()
 
 BOT_ID = None
+MY_USER_ID = None
 
 refund_detected = False
 refund_event = asyncio.Event()
 
-# Anti-cadena: timestamp del último flujo iniciado
 last_flow_start = 0
 
 # ============================================================
@@ -602,7 +605,7 @@ async def main(trigger_name):
     global refund_detected
 
     reset_metrics(trigger_name)
-    log(f"\n>>> SCRIPT v8.8.7 - TRIGGER @{trigger_name} <<<")
+    log(f"\n>>> SCRIPT v8.8.7-FIX - TRIGGER @{trigger_name} <<<")
 
     while True:
         used_buttons.clear()
@@ -702,8 +705,17 @@ async def main(trigger_name):
 # HANDLERS
 # ============================================================
 
+async def debug_all_handler(event):
+    """Handler de diagnóstico: loguea TODOS los mensajes."""
+    if not DEBUG_ALL_MESSAGES:
+        return
+    sender = event.sender_id
+    chat_id = event.chat_id
+    is_out = event.message.out
+    text = (event.message.text or "")[:80]
+    log(f"   [DEBUG-ALL] sender={sender} chat_id={chat_id} out={is_out} text={text!r}")
+
 async def refund_handler(event):
-    """Detecta mensajes de refund (aunque ya no reinicia, solo loguea)."""
     global refund_detected
     if BOT_ID is not None and event.sender_id != BOT_ID:
         return
@@ -723,7 +735,6 @@ async def trigger_flow(trigger_name):
     if _is_running:
         log(f">>> Ya hay una ejecución en curso. Ignorando trigger de @{trigger_name}. <<<")
         return
-    # Cooldown anti-cadena
     elapsed = time.monotonic() - last_flow_start
     if elapsed < TRIGGER_COOLDOWN:
         log(f">>> Cooldown activo ({elapsed:.1f}s < {TRIGGER_COOLDOWN}s). Ignorando trigger de @{trigger_name}. <<<")
@@ -746,8 +757,6 @@ async def bot_trigger_handler(event):
     if event.message.out:
         return
     text = event.message.text or ""
-    # Ignorar mensajes que claramente son respuestas operativas de nuestras acciones
-    # (aunque durante el flujo el lock ya los ignora)
     log(f"   [bot-trigger] Mensaje recibido de {event.sender_id}: {text[:80]!r}")
     asyncio.create_task(trigger_flow(TRIGGER_USERNAME))
 
@@ -758,8 +767,7 @@ async def manual_trigger_handler(event):
     text = (event.message.text or "").strip().lower()
     if not text:
         return
-    # Loguear cualquier mensaje saliente para diagnóstico
-    log(f"   [diag] Mensaje saliente detectado: chat_id={event.chat_id} | texto={text[:60]!r}")
+    log(f"   [diag-manual] Mensaje saliente: chat_id={event.chat_id} texto={text[:60]!r}")
     if MANUAL_TRIGGER_WORD in text:
         log(f"   [trigger-manual] ✅ Palabra '{MANUAL_TRIGGER_WORD}' detectada. Disparando flujo...")
         asyncio.create_task(trigger_flow("MANUAL_TEST"))
@@ -769,7 +777,7 @@ async def manual_trigger_handler(event):
 # ============================================================
 
 async def run_forever():
-    global BOT_ID
+    global BOT_ID, MY_USER_ID
     while True:
         try:
             if not SESSION_STRING:
@@ -778,6 +786,7 @@ async def run_forever():
             me = await client.get_me()
             if me is None:
                 raise RuntimeError("Sesión no autorizada")
+            MY_USER_ID = me.id
 
             if BOT_ID is None:
                 try:
@@ -790,24 +799,27 @@ async def run_forever():
             client.remove_event_handler(bot_trigger_handler, events.NewMessage)
             client.remove_event_handler(refund_handler, events.NewMessage)
             client.remove_event_handler(manual_trigger_handler, events.NewMessage)
+            client.remove_event_handler(debug_all_handler, events.NewMessage)
 
-            # Trigger principal: cualquier mensaje del bot
+            # DEBUG: loguear TODO
+            if DEBUG_ALL_MESSAGES:
+                client.add_event_handler(debug_all_handler, events.NewMessage())
+
+            # Trigger: mensajes del bot
             client.add_event_handler(bot_trigger_handler, events.NewMessage(from_users=BOT_ID))
 
-            # Refund detector (para logging)
+            # Refund detector
             client.add_event_handler(refund_handler, events.NewMessage())
 
-            # Trigger manual (Saved Messages)
-            client.add_event_handler(
-                manual_trigger_handler,
-                events.NewMessage(chats='me', outgoing=True)
-            )
+            # Trigger manual: mensajes salientes (cualquier chat)
+            client.add_event_handler(manual_trigger_handler, events.NewMessage(outgoing=True))
 
-            log(">>> SERVICIO v8.8.7 ACTIVO (COL) - Bot: @KingKongccs2bot <<<")
-            log(f">>> Logueado como: {me.first_name} (@{me.username}) <<<")
+            log(">>> SERVICIO v8.8.7-FIX ACTIVO (COL) <<<")
+            log(f">>> Logueado como: {me.first_name} (@{me.username}) | user_id={MY_USER_ID} <<<")
             log(f">>> Bot: {BOT} (ID: {BOT_ID}) <<<")
             log(f">>> Cualquier mensaje de {BOT} dispara el flujo (cooldown: {TRIGGER_COOLDOWN}s) <<<")
             log(f">>> Trigger MANUAL: envíate '{MANUAL_TRIGGER_WORD}' a Saved Messages <<<")
+            log(f">>> DEBUG_ALL_MESSAGES: {DEBUG_ALL_MESSAGES} <<<")
             log(f">>> Precio máx: ${MAX_PRICE} | Tarjeta: {HEADER_ATTEMPTS} | Check: {CHECK_ATTEMPTS} | Clic: {MAX_RETRIES}x cada {RETRY_SLEEP}s <<<")
 
             await client.run_until_disconnected()
