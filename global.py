@@ -756,6 +756,10 @@ async def manual_trigger_handler(event):
     if not event.message.out:
         return
     text = (event.message.text or "").strip().lower()
+    if not text:
+        return
+    # Loguear cualquier mensaje saliente para diagnóstico
+    log(f"   [diag] Mensaje saliente detectado: chat_id={event.chat_id} | texto={text[:60]!r}")
     if MANUAL_TRIGGER_WORD in text:
         log(f"   [trigger-manual] ✅ Palabra '{MANUAL_TRIGGER_WORD}' detectada. Disparando flujo...")
         asyncio.create_task(trigger_flow("MANUAL_TEST"))
